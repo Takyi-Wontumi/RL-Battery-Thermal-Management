@@ -1,0 +1,14 @@
+cat > requirements.txt <<'EOF'
+# Python 3.11 recommended
+
+numpy>=1.26
+pandas>=2.2
+matplotlib>=3.8
+gymnasium>=0.29
+
+stable-baselines3[extra]>=2.3.0
+tensorboard>=2.16
+
+pillow>=10.0
+tqdm>=4.66
+EOF

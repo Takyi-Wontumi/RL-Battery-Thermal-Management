@@ -395,28 +395,55 @@ class BatteryThermalEnv(gym.Env):
 
     def _compute_reward(self, u: float) -> float:
         """
-        Reward balances temperature tracking, overheating avoidance, energy use,
-        and command smoothness.
+        Reward balances target tracking, overheating avoidance, cooling effort,
+        action smoothness, and settling speed.
 
         Higher is better. The reward is negative cost.
         """
         cfg = self.config
 
-        temp_error = (self.temperature - cfg.target_temp) / max(1e-6, cfg.soft_max_temp - cfg.target_temp)
-        temp_cost = cfg.temp_error_weight * temp_error**2
+        # 1. Temperature tracking cost
+        temp_error = (self.temperature - cfg.target_temp) / max(
+            1e-6, cfg.soft_max_temp - cfg.target_temp
+        )
+        temp_tracking_cost = cfg.temp_error_weight * temp_error**2
 
+        # 2. Over-temperature safety cost
         over_temp = max(0.0, self.temperature - cfg.soft_max_temp)
-        over_temp_cost = cfg.over_temp_weight * (over_temp / max(1e-6, cfg.hard_max_temp - cfg.soft_max_temp)) ** 2
+        over_temp_cost = cfg.over_temp_weight * (
+            over_temp / max(1e-6, cfg.hard_max_temp - cfg.soft_max_temp)
+        ) ** 2
 
-        action_cost = cfg.action_weight * u**2
-        smoothness_cost = cfg.action_smoothness_weight * (u - self.previous_action) ** 2
+        # 3. Cooling energy cost
+        cooling_energy_cost = cfg.action_weight * u**2
 
+        # 4. Cooling smoothness cost
+        action_smoothness_cost = cfg.action_smoothness_weight * (
+            u - self.previous_action
+        ) ** 2
+
+        # 5. Settling cost: penalize staying away from target
+        settling_band = 1.0  # degrees C around target
+        distance_outside_band = max(
+            0.0, abs(self.temperature - cfg.target_temp) - settling_band
+        )
+        settling_cost = 0.05 * distance_outside_band
+
+        # 6. Hard failure penalty
         hard_penalty = 0.0
         if self.temperature >= cfg.hard_max_temp or self.temperature <= cfg.min_temp:
             hard_penalty = cfg.hard_violation_penalty
 
-        total_cost = temp_cost + over_temp_cost + action_cost + smoothness_cost + hard_penalty
-        return -float(total_cost)
+        reward = -(
+            temp_tracking_cost
+            + over_temp_cost
+            + cooling_energy_cost
+            + action_smoothness_cost
+            + settling_cost
+            + hard_penalty
+        )
+
+        return float(reward)
 
     def _get_observation(self) -> np.ndarray:
         """Return observation vector."""
