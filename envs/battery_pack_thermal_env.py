@@ -46,7 +46,7 @@ PackHeatProfile = Callable[[float, np.random.Generator, int], np.ndarray]
 @dataclass
 class BatteryPackThermalConfig:
     # Simulation
-    n_cells: int = 8
+    n_cells: int = 16
     total_time: float = 1800.0
     dt: float = 1.0
     seed: Optional[int] = 7
@@ -73,18 +73,27 @@ class BatteryPackThermalConfig:
     min_temp: float = -10.0
 
     # Reward weights
-    max_temp_weight: float = 1.0
-    mean_temp_weight: float = 0.15
-    imbalance_weight: float = 0.40
-    over_temp_weight: float = 10.0
-    action_weight: float = 0.04
-    action_smoothness_weight: float = 0.08
+    max_temp_weight: float = 2.0
+    mean_temp_weight: float = 0.1
+    imbalance_weight: float = 1.0
+    over_temp_weight: float = 15.0
+    action_weight: float = 0.06
+    action_smoothness_weight: float = 0.04
     hard_violation_penalty: float = 150.0
 
     # Randomization
     initial_temp_randomization: float = 1.0
     ambient_randomization: float = 1.5
     cell_heat_variation: float = 0.12
+
+    # Physical cell spacing (optional).  When set, overrides conduction_coupling
+    # using Fourier's law: g = g_ref * (d_ref / d_spacing).
+    # Reference point: 2 mm gap ↔ 8.0 W/K.
+    cell_spacing_m: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        if self.cell_spacing_m is not None and self.cell_spacing_m > 0:
+            self.conduction_coupling = 8.0 * (0.002 / self.cell_spacing_m)
 
 
 # -----------------------------------------------------------------------------
@@ -352,12 +361,10 @@ class BatteryPackThermalEnv(gym.Env):
         imbalance_cost = cfg.imbalance_weight * (temp_std / normalizer) ** 2
 
         over_temp = max(0.0, max_temp - cfg.soft_max_temp)
-        over_temp_cost = cfg.over_temp_weight * (
-            over_temp / max(1e-6, cfg.hard_max_temp - cfg.soft_max_temp)
-        ) ** 2
+        over_temp_cost = over_temp ** 2
 
-        action_cost = cfg.action_weight * u**2
-        smoothness_cost = cfg.action_smoothness_weight * (u - self.previous_action) ** 2
+        action_cost = 0.02 * u ** 2
+        smoothness_cost = 0.01 * (u - self.previous_action) ** 2
 
         hard_penalty = 0.0
         if max_temp >= cfg.hard_max_temp or np.min(self.temperatures) <= cfg.min_temp:
