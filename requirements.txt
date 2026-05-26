@@ -10,3 +10,5 @@ torch>=2.0
 tensorboard>=2.16
 pillow>=10.0
 tqdm>=4.66
+pyvista>=0.43
+imageio>=2.34

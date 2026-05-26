@@ -189,7 +189,7 @@ class BatteryPackThermalEnv3D(gym.Env):
         u ∈ [0, 1] — shared cooling command applied to all boundary cells.
     """
 
-    metadata = {"render_modes": []}
+    metadata = {"render_modes": ["human"]}
 
     def __init__(
         self,
@@ -381,6 +381,22 @@ class BatteryPackThermalEnv3D(gym.Env):
         self.episode_log["q_gen_total"].append(float(np.sum(q_gen)))
         self.episode_log["q_gen_max_cell"].append(float(np.max(q_gen)))
         self.episode_log["q_cool_total"].append(metrics.get("q_cool_total", 0.0))
+
+    def render(self) -> None:
+        if self.render_mode != "human":
+            return
+        try:
+            from scripts.render_pack_3d_pyvista import render_temperature_field
+        except ImportError:
+            print("PyVista not installed — run: pip install pyvista")
+            return
+        render_temperature_field(
+            T=self.thermal_model.T,
+            cell=self.cell_config,
+            pack=self.pack_config,
+            vmin=self.pack_config.ambient_temp_c,
+            vmax=self.pack_config.safe_temp_c,
+        )
 
     def get_episode_log(self) -> Dict[str, np.ndarray]:
         return {k: np.asarray(v) for k, v in self.episode_log.items()}
