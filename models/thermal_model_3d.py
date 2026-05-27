@@ -147,55 +147,82 @@ class BatteryPackThermal3D:
 
         return Q
 
-    def compute_cooling(self, u: float) -> np.ndarray:
+    def compute_cooling(self, u_zones: np.ndarray) -> np.ndarray:
         """
-        Convective cooling for each cell.
+        Multi-zone convective cooling.
 
-        Interior cells have zero exposed area and receive no direct convective
-        cooling — they can only lose heat through neighbor conduction to the
-        boundary cells that are cooled.
+        WHY zones:
+            A single cooling command forces every cell to the same h, so the
+            controller must over-cool boundary cells to reach interior hot-spots,
+            wasting energy.  Per-zone commands let the agent direct more cooling
+            exactly where the temperature is highest.
 
-        Q_cool[i,j,k] = h(u) * A_cell * exposed_fraction[i,j,k] * (T - T_amb)
+        Zone definition: each x-slice (i-index) is one zone.
+            Zone 0 = cells [0, :, :]   (left boundary column)
+            Zone 1 = cells [1, :, :]
+            ...
+            Zone Nx-1 = cells [Nx-1, :, :] (right boundary column)
+
+        Interior cells with zero exposed area still receive no direct convective
+        cooling regardless of zone command — heat must conduct to boundary cells.
+
+        Args:
+            u_zones: Cooling commands, shape (Nx,) or scalar.
+                     Scalar is broadcast to all zones for backward compatibility.
+
+        Returns:
+            Q_cool: Heat removed [W], shape (Nx, Ny, Nz).
         """
-        u = float(np.clip(u, 0.0, 1.0))
-        h = self.pack.h_min_w_per_m2_k + u * (
-            self.pack.h_max_w_per_m2_k - self.pack.h_min_w_per_m2_k
+        u_zones = np.asarray(u_zones, dtype=np.float64).reshape(-1)
+        if u_zones.size == 1:
+            u_zones = np.full(self.Nx, float(u_zones[0]))
+        u_zones = np.clip(u_zones, 0.0, 1.0)
+
+        # h per zone: shape (Nx,) → broadcast column-wise over (Nx, Ny, Nz)
+        h_zones = (
+            self.pack.h_min_w_per_m2_k
+            + u_zones * (self.pack.h_max_w_per_m2_k - self.pack.h_min_w_per_m2_k)
         )
-        exposed_area = self.cell_area * self._exposed_area
-        # Clamp delta-T at zero: cooling cannot actively drive cells below ambient.
+        h_array = h_zones[:, np.newaxis, np.newaxis]  # (Nx, 1, 1) broadcasts over Ny, Nz
+
+        exposed_area = self.cell_area * self._exposed_area  # (Nx, Ny, Nz)
         dT = np.maximum(self.T - self.pack.ambient_temp_c, 0.0)
-        return h * exposed_area * dT
+        return h_array * exposed_area * dT
 
     # ------------------------------------------------------------------
     # Time step
     # ------------------------------------------------------------------
 
-    def step(self, u: float, dt: float, q_gen: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict]:
+    def step(self, u_zones, dt: float, q_gen: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict]:
         """
         Advance one time step.
 
         Args:
-            u:     Cooling command in [0, 1].
-            dt:    Time step size (s).
-            q_gen: Optional 3D heat generation array (W) with shape (Nx, Ny, Nz).
-                   If provided, overrides the stored q_gen for this step.
+            u_zones: Cooling command(s).  Scalar or shape (Nx,) array.
+                     Scalar is broadcast to all zones (backward compatible).
+            dt:      Time step size [s].
+            q_gen:   Optional 3D heat generation array [W], shape (Nx, Ny, Nz).
+                     If provided, overrides stored q_gen for this step.
 
         Returns:
-            T_copy: Copy of the updated temperature array.
-            metrics: Dict with T_max, T_avg, T_min, T_gradient, safe, critical.
+            T_copy:  Copy of the updated temperature array.
+            metrics: Dict with T_max, T_avg, T_min, T_gradient, safe, critical,
+                     q_cool_total, q_gen_total, q_cool_per_zone.
         """
         if q_gen is not None:
             self.q_gen = q_gen
 
         Q_cond = self.compute_conduction()
-        Q_cool = self.compute_cooling(u)
+        Q_cool = self.compute_cooling(u_zones)
 
         dTdt = (self.q_gen + Q_cond - Q_cool) / self.cell_heat_capacity
         self.T = self.T + dt * dTdt
 
         metrics = self.get_metrics()
         metrics["q_cool_total"] = float(np.sum(Q_cool))
-        metrics["q_gen_total"]  = float(np.sum(self.q_gen))
+        metrics["q_gen_total"] = float(np.sum(self.q_gen))
+        # Per-zone cooling power — useful for energy accounting and reward shaping
+        metrics["q_cool_per_zone"] = np.sum(Q_cool, axis=(1, 2)).tolist()
         return self.T.copy(), metrics
 
     # ------------------------------------------------------------------
@@ -215,20 +242,16 @@ class BatteryPackThermal3D:
             "critical": T_max >= self.pack.critical_temp_c,
         }
 
-    def get_observation(self, u_prev: float = 0.0) -> np.ndarray:
+    def get_thermal_obs(self) -> np.ndarray:
         """
-        Pack-level observation normalized for RL (7 elements).
+        Six normalized pack-level thermal features (no action history).
 
         obs = [T_max_norm, T_avg_norm, T_min_norm,
-               T_gradient_norm, T_variance_norm, T_center_norm,
-               u_prev]
+               T_gradient_norm, T_variance_norm, T_center_norm]
 
-        T_center is the geometric center cell — typically the hardest to cool
-        and an early indicator of hotspot build-up that T_max alone misses until
-        the hotspot has already propagated to a boundary cell.
-
-        All temperatures are normalized by (safe_temp - target_temp) so that
-        obs[k] = 0 means at target, obs[k] = 1 means at the safe limit.
+        All temperatures normalized by (safe_temp - target_temp):
+            0  → at target temperature
+            1  → at the safe limit
         """
         metrics = self.get_metrics()
         scale = max(1e-6, self.pack.safe_temp_c - self.pack.target_temp_c)
@@ -244,8 +267,19 @@ class BatteryPackThermal3D:
             metrics["T_gradient"] / scale,
             T_variance / scale,
             (T_center - target) / scale,
-            float(u_prev),
         ], dtype=np.float32)
+
+    def get_observation(self, u_prev: float = 0.0) -> np.ndarray:
+        """
+        Backward-compatible 7-element observation (single-zone legacy API).
+        Appends the scalar u_prev to the 6 thermal features.
+        """
+        thermal = self.get_thermal_obs()
+        return np.append(thermal, float(u_prev)).astype(np.float32)
+
+    def get_zone_max_temps(self) -> np.ndarray:
+        """Return the maximum temperature per x-zone, shape (Nx,)."""
+        return np.max(self.T, axis=(1, 2))  # max over Ny, Nz for each zone
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +299,7 @@ if __name__ == "__main__":
     print(f"Initial T_max:      {model.T.max():.2f} °C")
 
     for _ in range(100):
-        T, metrics = model.step(u=0.5, dt=1.0)
+        T, metrics = model.step(u_zones=0.5, dt=1.0)
 
     print(f"After 100 s | T_max={metrics['T_max']:.2f}  T_avg={metrics['T_avg']:.2f}  "
           f"T_gradient={metrics['T_gradient']:.3f}  safe={metrics['safe']}")

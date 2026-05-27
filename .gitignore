@@ -26,7 +26,6 @@ logs/
 *.log
 
 # RL models and checkpoints
-models/
 *.zip
 *.pkl
 

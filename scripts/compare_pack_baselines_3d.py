@@ -243,8 +243,17 @@ def run_controller_case(
 
     log = env.get_episode_log()
 
+    # Derive a scalar action series from multi-zone actions for backward-compatible
+    # metrics and plotting (mean across zones each step).
+    if "actions" in log and "action" not in log:
+        actions_2d = np.asarray(log["actions"])          # shape (T, n_zones)
+        log["action"] = np.mean(actions_2d, axis=1)      # shape (T,) mean per step
+
     failed = bool(terminated and log["T_max"].max() >= pack_config.critical_temp_c)
     time_above_safe = float(np.sum(log["T_max"] > pack_config.safe_temp_c) * env.dt_s)
+
+    # Safety status for two-stage ranking (R2)
+    is_safe = (time_above_safe == 0.0) and (float(log["T_max"].max()) < pack_config.critical_temp_c)
 
     metrics: Dict = {
         "profile": profile_name,
@@ -261,8 +270,16 @@ def run_controller_case(
         "total_cooling_effort": float(log["action"].sum() * env.dt_s),
         "action_variation": float(np.abs(np.diff(log["action"])).sum()),
         "total_reward": float(total_reward),
+        "is_safe": bool(is_safe),
         "failed": failed,
     }
+
+    # Mean reward component values for per-controller diagnosis (R6)
+    from envs.battery_pack_thermal_env_3d import _REWARD_COMPONENT_KEYS
+    for k in _REWARD_COMPONENT_KEYS:
+        arr = log.get(k)
+        if arr is not None and len(arr) > 0:
+            metrics[f"mean_{k}"] = float(np.mean(arr))
 
     log["final_T3d"] = final_T3d
     return log, metrics
@@ -382,30 +399,60 @@ def plot_heat_profiles(all_logs: Dict, output_path: Path) -> None:
 # Reporting
 # ---------------------------------------------------------------------------
 
-def print_rankings(df: pd.DataFrame) -> None:
-    print("\n=== Ranking by mean total reward (higher = better) ===")
-    print(
-        df.groupby("controller")["total_reward"]
-        .mean()
-        .sort_values(ascending=False)
-        .to_string()
+def print_rankings(df: pd.DataFrame, pack_config: Optional["PackConfig"] = None) -> None:
+    """
+    Two-stage ranking (R2):
+      Stage 1 — Safety (pass/fail): time_above_safe == 0 AND T_max < critical
+      Stage 2 — Among safe controllers: ranked by mean total reward (descending)
+    """
+    agg = df.groupby("controller").agg(
+        is_safe=("is_safe", "all"),
+        total_reward=("total_reward", "mean"),
+        T_max_peak=("T_max_peak_C", "mean"),
+        time_above_safe=("time_above_safe_s", "mean"),
+        T_gradient_mean=("T_gradient_mean_C", "mean"),
+        mean_cooling=("mean_cooling_action", "mean"),
     )
 
-    print("\n=== Safety: time above safe limit (lower = better) ===")
-    print(
-        df.groupby("controller")["time_above_safe_s"]
-        .sum()
-        .sort_values(ascending=True)
-        .to_string()
-    )
+    safe_ctrl   = agg[agg["is_safe"]].sort_values("total_reward", ascending=False)
+    unsafe_ctrl = agg[~agg["is_safe"]].sort_values("T_max_peak", ascending=True)
 
-    print("\n=== Hotspot severity: mean T_gradient (lower = better) ===")
-    print(
-        df.groupby("controller")["T_gradient_mean_C"]
-        .mean()
-        .sort_values(ascending=True)
-        .to_string()
-    )
+    W = 72
+    print("\n" + "=" * W)
+    print("  STAGE 1 — Safety check  (pass = 0s above safe AND T_max < critical)")
+    print("=" * W)
+    for name, row in agg.iterrows():
+        status = "PASS" if row["is_safe"] else f"FAIL  ({row['time_above_safe']:.0f}s above safe)"
+        print(f"  {'PASS' if row['is_safe'] else 'FAIL':4s}  {name}")
+
+    print("\n" + "=" * W)
+    print("  STAGE 2 — Ranking among SAFE controllers  (higher reward = better)")
+    print(f"  {'Rank':<5} {'Controller':<32} {'Reward':>8} {'T_max':>8} {'Grad':>7} {'u_mean':>7}")
+    print("  " + "-" * (W - 2))
+    for rank, (name, row) in enumerate(safe_ctrl.iterrows(), 1):
+        tag = " ← RL" if ("SAC" in name or "PPO" in name) else ""
+        print(f"  {rank:<5} {name:<32} {row['total_reward']:>8.2f} "
+              f"{row['T_max_peak']:>7.2f}° {row['T_gradient_mean']:>6.2f}° "
+              f"{row['mean_cooling']:>6.3f}{tag}")
+
+    if not unsafe_ctrl.empty:
+        print("\n  UNSAFE controllers (excluded from ranking):")
+        for name, row in unsafe_ctrl.iterrows():
+            print(f"  ✗  {name:<32}  T_max={row['T_max_peak']:.2f}°C  "
+                  f"above_safe={row['time_above_safe']:.0f}s")
+
+    # Reward component breakdown (R6)
+    comp_cols = [c for c in df.columns if c.startswith("mean_reward_")]
+    if comp_cols:
+        print("\n" + "=" * W)
+        print("  Reward component breakdown (mean per step, higher = better)")
+        print(f"  {'Controller':<32} " + "  ".join(f"{c.replace('mean_reward_','')[:8]:>8}" for c in comp_cols))
+        print("  " + "-" * (W - 2))
+        for name in list(safe_ctrl.index) + list(unsafe_ctrl.index):
+            row = df[df["controller"] == name][comp_cols].mean()
+            vals = "  ".join(f"{row[c]:>8.3f}" for c in comp_cols)
+            print(f"  {name:<32} {vals}")
+    print("=" * W + "\n")
 
 
 # ---------------------------------------------------------------------------

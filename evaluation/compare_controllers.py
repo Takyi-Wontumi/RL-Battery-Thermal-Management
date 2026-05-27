@@ -136,14 +136,28 @@ def _make_dummy_env(pack_config: PackConfig) -> DummyVecEnv:
     return DummyVecEnv([_init])
 
 
-def load_sac(model_path: str, name: str = "SAC") -> Optional[PackSAC3DController]:
+def _expected_obs_dim(pack_config: PackConfig) -> int:
+    """Obs dim produced by the current env for a given pack config (no echem profile)."""
+    return 6 + pack_config.shape[0]  # 6 thermal stats + n_zones action history
+
+
+def load_sac(model_path: str, pack_config: PackConfig, name: str = "SAC") -> Optional[PackSAC3DController]:
     path = Path(model_path)
     if not path.exists():
         print(f"Warning: SAC model not found at {path} — skipping.")
         return None
     try:
         model = SAC.load(str(path), env=None, device="auto")
-        print(f"Loaded SAC: {path.name}")
+        model_obs_dim = model.observation_space.shape[0]
+        expected = _expected_obs_dim(pack_config)
+        if model_obs_dim != expected:
+            print(
+                f"Warning: SAC obs dim {model_obs_dim} != env obs dim {expected}. "
+                f"Model was trained on an old environment — skipping. "
+                f"Re-run training to get a compatible model."
+            )
+            return None
+        print(f"Loaded SAC: {path.name}  (obs_dim={model_obs_dim})")
         return PackSAC3DController(model=model, name=name)
     except Exception as exc:
         print(f"Warning: could not load SAC: {exc}")
@@ -166,12 +180,21 @@ def load_ppo(
         print(f"Warning: PPO vec_normalize not found at {vp} — skipping.")
         return None
     try:
+        model = PPO.load(str(mp), env=None, device="auto")
+        model_obs_dim = model.observation_space.shape[0]
+        expected = _expected_obs_dim(pack_config)
+        if model_obs_dim != expected:
+            print(
+                f"Warning: PPO obs dim {model_obs_dim} != env obs dim {expected}. "
+                f"Model was trained on an old environment — skipping. "
+                f"Re-run training to get a compatible model."
+            )
+            return None
         dummy = _make_dummy_env(pack_config)
-        vn    = VecNormalize.load(str(vp), dummy)
+        vn = VecNormalize.load(str(vp), dummy)
         vn.training    = False
         vn.norm_reward = False
-        model = PPO.load(str(mp), env=None, device="auto")
-        print(f"Loaded PPO: {mp.name}  (vecnorm: {vp.name})")
+        print(f"Loaded PPO: {mp.name}  (obs_dim={model_obs_dim}, vecnorm: {vp.name})")
         return PackPPO3DController(model=model, vec_normalize=vn, name=name)
     except Exception as exc:
         print(f"Warning: could not load PPO: {exc}")
@@ -189,7 +212,7 @@ def build_controllers(
     controllers = list(build_3d_baseline_controllers(pack_config))
 
     if args.sac_model:
-        ctrl = load_sac(args.sac_model, name="SAC")
+        ctrl = load_sac(args.sac_model, pack_config, name="SAC")
         if ctrl:
             controllers.append(ctrl)
 
@@ -304,6 +327,60 @@ def plot_time_series(
     plt.close(fig)
 
 
+def plot_reward_components(df: pd.DataFrame, path: Path) -> None:
+    """
+    Grouped bar chart showing mean reward component contribution per controller.
+    Makes explicit WHY each controller gets the score it does (R6).
+    Components with larger magnitude (more negative) are the binding constraints.
+    """
+    comp_cols = [c for c in df.columns if c.startswith("mean_reward_")]
+    if not comp_cols:
+        return
+
+    labels = [c.replace("mean_reward_", "").replace("_", " ") for c in comp_cols]
+    ctrl_means = df.groupby("controller")[comp_cols].mean()
+    controllers = ctrl_means.index.tolist()
+
+    # Sort safe controllers first, then unsafe
+    if "is_safe" in df.columns:
+        safe_set = set(df[df["is_safe"]]["controller"].unique())
+        controllers = (
+            [c for c in controllers if c in safe_set] +
+            [c for c in controllers if c not in safe_set]
+        )
+        ctrl_means = ctrl_means.loc[controllers]
+
+    x = np.arange(len(labels))
+    n = len(controllers)
+    width = 0.8 / n
+
+    colors = []
+    for name in controllers:
+        if "SAC" in name:   colors.append("#2ca02c")
+        elif "PPO" in name: colors.append("#1f77b4")
+        elif "PI" in name:  colors.append("#ff7f0e")
+        else:               colors.append("#aec7e8")
+
+    fig, ax = plt.subplots(figsize=(max(12, len(labels) * 2), 6))
+    for i, (ctrl, color) in enumerate(zip(controllers, colors)):
+        offset = (i - n / 2 + 0.5) * width
+        vals = ctrl_means.loc[ctrl, comp_cols].values
+        bars = ax.bar(x + offset, vals, width * 0.9, label=ctrl, color=color, alpha=0.85)
+
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=9)
+    ax.set_ylabel("Mean reward contribution per step", fontsize=10)
+    ax.set_title("Reward component breakdown — what each controller wins and loses on", fontsize=11, fontweight="bold")
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.set_ylim(bottom=min(ctrl_means.values.min() * 1.15, -0.05))
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def plot_bar(df: pd.DataFrame, metric: str, title: str, xlabel: str, path: Path,
              ascending: bool = True) -> None:
     ranked = df.groupby("controller")[metric].mean().sort_values(ascending=ascending)
@@ -334,34 +411,74 @@ def plot_bar(df: pd.DataFrame, metric: str, title: str, xlabel: str, path: Path,
 
 
 # ---------------------------------------------------------------------------
-# Rankings printout
+# Rankings printout — two-stage: safety first, then reward (R2)
 # ---------------------------------------------------------------------------
 
-def print_rankings(df: pd.DataFrame) -> None:
-    print("\n" + "=" * 65)
-    print("  Mean total reward (higher = better)")
-    print("=" * 65)
-    for rank, (name, val) in enumerate(
-        df.groupby("controller")["total_reward"].mean()
-          .sort_values(ascending=False).items(), 1
-    ):
-        tag = " ← SAC" if "SAC" in name else (" ← PPO" if "PPO" in name else
-              " ← classical best" if "PI tuned" in name else "")
-        print(f"  {rank:2d}. {name:34s}  {val:9.2f}{tag}")
+def print_rankings(df: pd.DataFrame, pack_config: Optional[PackConfig] = None) -> None:
+    """
+    Stage 1 — Safety pass/fail: time_above_safe == 0 AND T_max < critical_temp.
+    Stage 2 — Among safe controllers: rank by mean total reward.
+    Diagnostic footer shows mean reward component per controller (R6).
+    """
+    agg = df.groupby("controller").agg(
+        is_safe=("is_safe", "all") if "is_safe" in df.columns
+                else ("time_above_safe_s", lambda x: (x == 0).all()),
+        total_reward=("total_reward", "mean"),
+        T_max_peak=("T_max_peak_C", "mean"),
+        time_above_safe=("time_above_safe_s", "mean"),
+        T_gradient_mean=("T_gradient_mean_C", "mean"),
+        mean_cooling=("mean_cooling_action", "mean"),
+    )
+    # Fallback if is_safe column wasn't produced (old data)
+    if "is_safe" not in agg.columns:
+        agg["is_safe"] = agg["time_above_safe"] == 0
 
-    print("\n" + "=" * 65)
-    print("  Time above safe limit — s (lower = better)")
-    print("=" * 65)
-    for name, val in (df.groupby("controller")["time_above_safe_s"]
-                        .sum().sort_values().items()):
-        print(f"  {name:38s}  {val:6.0f} s")
+    safe_ctrl   = agg[agg["is_safe"]].sort_values("total_reward", ascending=False)
+    unsafe_ctrl = agg[~agg["is_safe"]].sort_values("T_max_peak", ascending=True)
 
-    print("\n" + "=" * 65)
-    print("  Peak temperature spread — °C (lower = better)")
-    print("=" * 65)
-    for name, val in (df.groupby("controller")["T_gradient_max_C"]
-                        .mean().sort_values().items()):
-        print(f"  {name:38s}  {val:5.2f} °C")
+    W = 76
+    print("\n" + "=" * W)
+    print("  EVALUATION RESULTS — two-stage ranking")
+    print("=" * W)
+
+    # Stage 1
+    print("\n  STAGE 1 — Safety  (pass = 0 s above safe AND T_max < critical)")
+    print(f"  {'Status':<6} {'Controller'}")
+    for name, row in agg.sort_values("is_safe", ascending=False).iterrows():
+        status = "PASS" if row["is_safe"] else "FAIL"
+        detail = "" if row["is_safe"] else f"  ({row['time_above_safe']:.0f}s above safe, peak {row['T_max_peak']:.1f}°C)"
+        print(f"  {status:<6} {name}{detail}")
+
+    # Stage 2
+    print(f"\n  STAGE 2 — Ranking among safe controllers  (higher = better)")
+    print(f"  {'Rank':<5} {'Controller':<36} {'Reward':>8} {'T_max':>7} {'Grad':>7} {'u_mean':>7}")
+    print("  " + "-" * (W - 2))
+    for rank, (name, row) in enumerate(safe_ctrl.iterrows(), 1):
+        tag = " ← SAC" if "SAC" in name else (" ← PPO" if "PPO" in name else "")
+        print(f"  {rank:<5} {name:<36} {row['total_reward']:>8.2f} "
+              f"{row['T_max_peak']:>6.1f}° {row['T_gradient_mean']:>6.2f}° "
+              f"{row['mean_cooling']:>6.3f}{tag}")
+
+    if not unsafe_ctrl.empty:
+        print(f"\n  UNSAFE — excluded from ranking:")
+        for name, row in unsafe_ctrl.iterrows():
+            print(f"  ✗  {name:<36}  T_max={row['T_max_peak']:.1f}°C  "
+                  f"above_safe={row['time_above_safe']:.0f}s")
+
+    # Component diagnosis
+    comp_cols = [c for c in df.columns if c.startswith("mean_reward_")]
+    if comp_cols:
+        labels = [c.replace("mean_reward_", "") for c in comp_cols]
+        print(f"\n  Reward component diagnosis (mean/step — which term costs most)")
+        header = f"  {'Controller':<36} " + " ".join(f"{l[:9]:>9}" for l in labels)
+        print(header)
+        print("  " + "-" * (W - 2))
+        for name in list(safe_ctrl.index) + list(unsafe_ctrl.index):
+            row_vals = df[df["controller"] == name][comp_cols].mean()
+            vals = " ".join(f"{row_vals[c]:>9.3f}" for c in comp_cols)
+            print(f"  {name:<36} {vals}")
+
+    print("=" * W + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +497,8 @@ def main() -> None:
         cell_spacing_m=0.002,
         ambient_temp_c=25.0,
         target_temp_c=35.0,
+        target_low_temp_c=30.0,
+        target_high_temp_c=38.0,
         safe_temp_c=45.0,
         critical_temp_c=55.0,
         h_min_w_per_m2_k=5.0,
@@ -438,7 +557,9 @@ def main() -> None:
              "Mean reward",            results_dir / "reward_bar_comparison.png",
              ascending=False)
 
-    print_rankings(df)
+    plot_reward_components(df, results_dir / "reward_component_breakdown.png")
+
+    print_rankings(df, pack_config)
 
     print(f"\nSaved to {results_dir}/")
     for f in sorted(results_dir.iterdir()):

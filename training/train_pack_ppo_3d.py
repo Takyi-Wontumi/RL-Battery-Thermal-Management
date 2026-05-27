@@ -97,7 +97,7 @@ def randomized_3d_heat_profile() -> Pack3DHeatProfile:
 
     def _reset(rng: np.random.Generator, shape: Tuple[int, int, int]) -> None:
         mode = rng.choice(["constant", "step", "pulsed", "random"])
-        q_base = float(rng.uniform(55.0, 180.0))
+        q_base = float(rng.uniform(10.0, 35.0))
         weights = rng.uniform(0.80, 1.20, size=shape).astype(np.float64)
         hx = int(rng.integers(0, shape[0]))
         hy = int(rng.integers(0, shape[1]))
@@ -129,14 +129,14 @@ def randomized_3d_heat_profile() -> Pack3DHeatProfile:
             phase   = (t % float(_state["period"])) / float(_state["period"])
             q_total = 1.75 * q_base if phase < float(_state["duty_cycle"]) else 0.55 * q_base
         else:
-            noise = rng.normal(0.0, 6.0)
-            _state["q_base"] = 0.90 * q_base + 0.10 * 100.0 + noise
-            q_total = float(np.clip(float(_state["q_base"]), 40.0, 220.0))
+            noise = rng.normal(0.0, 1.5)
+            _state["q_base"] = 0.90 * q_base + 0.10 * 20.0 + noise
+            q_total = float(np.clip(float(_state["q_base"]), 8.0, 50.0))
             w_noise = rng.normal(0.0, 0.002, size=shape)
             weights = np.clip(weights + w_noise, 0.01, None)
             weights /= weights.sum()
             _state["weights"] = weights
-        q_total = float(np.clip(q_total, 35.0, 230.0))
+        q_total = float(np.clip(q_total, 8.0, 50.0))
         return (q_total * weights).astype(np.float64)
 
     return profile
