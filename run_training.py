@@ -188,8 +188,8 @@ def main() -> None:
     model_root = _model_root(args)
     log_root   = _log_root(args)
 
-    ppo_model_dir = model_root / "ppo_pack_3d"
-    sac_model_dir = model_root / "sac_pack_3d"
+    ppo_model_dir = model_root / "ppo_pack_3d_multizone_sensor"
+    sac_model_dir = model_root / "sac_pack_3d_multizone_sensor"
     ppo_model     = ppo_model_dir / "best_model.zip"
     sac_model     = sac_model_dir / "best_model.zip"
     eval_dir      = PROJECT_ROOT / "outputs" / "comparison"
@@ -239,7 +239,7 @@ def main() -> None:
         "--n-envs",    str(args.n_envs),
         "--device",    args.device,
         "--save-dir",  str(ppo_model_dir),
-        "--log-dir",   str(log_root / "ppo_pack_3d"),
+        "--log-dir",   str(log_root / "ppo_pack_3d_multizone_sensor"),
         "--seed",      str(args.seed),
     ]
     if args.ppo_resume:
@@ -252,7 +252,7 @@ def main() -> None:
         "--timesteps", str(args.sac_steps),
         "--device",    args.device,
         "--save-dir",  str(sac_model_dir),
-        "--log-dir",   str(log_root / "sac_pack_3d"),
+        "--log-dir",   str(log_root / "sac_pack_3d_multizone_sensor"),
         "--seed",      str(args.seed),
     ]
     if args.sac_resume:

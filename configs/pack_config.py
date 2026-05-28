@@ -26,7 +26,7 @@ Important:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple, Dict
+from typing import Optional, Tuple, Dict
 
 import numpy as np
 
@@ -193,6 +193,58 @@ class PackConfig:
     # -----------------------------------------------------------------------
     episode_time_s: float = 1800.0
     dt_s: float = 1.0
+
+    # -----------------------------------------------------------------------
+    # Multi-zone cooling
+    # -----------------------------------------------------------------------
+    # num_cooling_zones=4 gives a 2×2 spatial split (x-left/right × y-front/rear).
+    # Use 1 to revert to global single-zone control.
+    enable_multizone_cooling: bool = True
+    num_cooling_zones: int = 4
+
+    # -----------------------------------------------------------------------
+    # Cooling actuator delay
+    # -----------------------------------------------------------------------
+    # Models the lag between a controller command and the actual coolant response
+    # (valve travel, pump ramp-up, thermal inertia of the manifold).
+    # 10 s is a realistic first estimate for forced-air cooling.
+    enable_cooling_delay: bool = True
+    cooling_delay_s: float = 10.0
+
+    # -----------------------------------------------------------------------
+    # Actuator rate limit
+    # -----------------------------------------------------------------------
+    # Maximum change in normalised cooling command per second.
+    # 0.05 / s → full range (0→1) traversed in 20 s, preventing instantaneous
+    # bang-bang switching that would damage actuators in hardware.
+    enable_cooling_rate_limit: bool = True
+    max_cooling_rate_per_s: float = 0.05
+
+    # -----------------------------------------------------------------------
+    # Randomized hotspot
+    # -----------------------------------------------------------------------
+    # Hotspot cells are selected from the full cell count at episode start.
+    # Optionally constrained to a randomly selected cooling zone so the
+    # multi-zone controller has a clear spatial target.
+    #
+    # hotspot_seed: if set, a dedicated RNG is used so hotspot location is
+    # reproducible regardless of training episode order. None → shares the
+    # environment's main RNG (fully random during training).
+    enable_random_hotspot: bool = True
+    num_hotspot_cells: int = 3
+    hotspot_multiplier_min: float = 2.0   # was 1.5 — 2× min creates clear spatial gradient
+    hotspot_multiplier_max: float = 4.0   # was 2.5 — 4× max stresses zone controller
+    hotspot_persistent: bool = True          # keep hotspot fixed for whole episode
+    hotspot_change_interval_s: float = 600.0  # only used when persistent=False
+    hotspot_seed: Optional[int] = None        # None → use env RNG (random training)
+
+    # -----------------------------------------------------------------------
+    # Global heat-generation scale factor
+    # -----------------------------------------------------------------------
+    # Multiplies every cell's q_gen before the hotspot overlay.
+    # 1.0 = nominal physics.  2.5 pushes no-cooling above 45°C in ~13 min.
+    # Applied in env.step() after the heat profile, before hotspot.
+    q_gen_multiplier: float = 1.0
 
 
 # ---------------------------------------------------------------------------

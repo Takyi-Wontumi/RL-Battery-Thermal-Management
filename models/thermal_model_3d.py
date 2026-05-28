@@ -149,45 +149,40 @@ class BatteryPackThermal3D:
 
     def compute_cooling(self, u_zones: np.ndarray) -> np.ndarray:
         """
-        Multi-zone convective cooling.
+        Convective cooling — accepts per-cell, per-x-column, or scalar commands.
 
-        WHY zones:
-            A single cooling command forces every cell to the same h, so the
-            controller must over-cool boundary cells to reach interior hot-spots,
-            wasting energy.  Per-zone commands let the agent direct more cooling
-            exactly where the temperature is highest.
-
-        Zone definition: each x-slice (i-index) is one zone.
-            Zone 0 = cells [0, :, :]   (left boundary column)
-            Zone 1 = cells [1, :, :]
-            ...
-            Zone Nx-1 = cells [Nx-1, :, :] (right boundary column)
-
-        Interior cells with zero exposed area still receive no direct convective
-        cooling regardless of zone command — heat must conduct to boundary cells.
+        Routing logic (checked in order):
+          1. shape == (Nx, Ny, Nz)  → per-cell commands (quadrant-zone path).
+          2. size == 1              → scalar broadcast to all cells.
+          3. size == Nx             → per-x-column broadcast (legacy path).
 
         Args:
-            u_zones: Cooling commands, shape (Nx,) or scalar.
-                     Scalar is broadcast to all zones for backward compatibility.
+            u_zones: Cooling commands in [0, 1].
+                     Shape (Nx, Ny, Nz), (Nx,), or scalar.
 
         Returns:
             Q_cool: Heat removed [W], shape (Nx, Ny, Nz).
         """
-        u_zones = np.asarray(u_zones, dtype=np.float64).reshape(-1)
-        if u_zones.size == 1:
-            u_zones = np.full(self.Nx, float(u_zones[0]))
-        u_zones = np.clip(u_zones, 0.0, 1.0)
+        u = np.asarray(u_zones, dtype=np.float64)
 
-        # h per zone: shape (Nx,) → broadcast column-wise over (Nx, Ny, Nz)
-        h_zones = (
+        if u.shape == (self.Nx, self.Ny, self.Nz):
+            # Per-cell commands from quadrant-zone environment
+            u_cell = np.clip(u, 0.0, 1.0)
+        elif u.size == 1:
+            u_cell = np.full((self.Nx, self.Ny, self.Nz), float(u.flat[0]))
+            u_cell = np.clip(u_cell, 0.0, 1.0)
+        else:
+            # Per-x-column broadcast (legacy: zone = x-column)
+            u_col = np.clip(u.reshape(-1), 0.0, 1.0)
+            u_cell = u_col[:, np.newaxis, np.newaxis] * np.ones((self.Nx, self.Ny, self.Nz))
+
+        h_cell = (
             self.pack.h_min_w_per_m2_k
-            + u_zones * (self.pack.h_max_w_per_m2_k - self.pack.h_min_w_per_m2_k)
+            + u_cell * (self.pack.h_max_w_per_m2_k - self.pack.h_min_w_per_m2_k)
         )
-        h_array = h_zones[:, np.newaxis, np.newaxis]  # (Nx, 1, 1) broadcasts over Ny, Nz
-
         exposed_area = self.cell_area * self._exposed_area  # (Nx, Ny, Nz)
         dT = np.maximum(self.T - self.pack.ambient_temp_c, 0.0)
-        return h_array * exposed_area * dT
+        return h_cell * exposed_area * dT
 
     # ------------------------------------------------------------------
     # Time step

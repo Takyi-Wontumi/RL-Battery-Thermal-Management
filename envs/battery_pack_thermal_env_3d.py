@@ -55,6 +55,13 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from configs.pack_config import CellConfig, PackConfig, build_default_configs
 from models.thermal_model_3d import BatteryPackThermal3D
+from configs.sensor_simulation import (
+    SensorConfig,
+    ActuatorConfig,
+    SensorPacket,
+    SensorSimulation,
+    CoolingActuatorSimulation,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +178,52 @@ def make_3d_profile(profile_name: str) -> Pack3DHeatProfile:
 
 
 # ---------------------------------------------------------------------------
+# Zone mapping: assigns each cell to a 2×2 spatial cooling zone
+# ---------------------------------------------------------------------------
+
+def build_zone_ids(shape: Tuple[int, int, int], num_zones: int = 4) -> np.ndarray:
+    """
+    Assign each cell to a cooling zone.
+
+    Iteration order matches zone_ids[k*Nx*Ny + j*Nx + i] so that
+    _build_zone_ids_3d() can map back to T[i, j, k] cleanly.
+
+    num_zones=4 — 2×2 spatial split in the x-y plane:
+        zone 0: x-left  (i < Nx/2), y-front (j < Ny/2)
+        zone 1: x-right (i >= Nx/2), y-front (j < Ny/2)
+        zone 2: x-left  (i < Nx/2), y-rear  (j >= Ny/2)
+        zone 3: x-right (i >= Nx/2), y-rear  (j >= Ny/2)
+
+    z-layers share the same x-y zone assignment (cooling is top-down).
+    num_zones=1 collapses all cells into a single global zone.
+    """
+    Nx, Ny, Nz = shape
+    zone_ids = []
+    for k in range(Nz):
+        for j in range(Ny):
+            for i in range(Nx):
+                if num_zones == 1:
+                    zone = 0
+                elif num_zones == 4:
+                    x_right = i >= Nx / 2
+                    y_rear = j >= Ny / 2
+                    if not x_right and not y_rear:
+                        zone = 0
+                    elif x_right and not y_rear:
+                        zone = 1
+                    elif not x_right and y_rear:
+                        zone = 2
+                    else:
+                        zone = 3
+                else:
+                    raise ValueError(
+                        f"Unsupported num_zones={num_zones}. Use 1 or 4."
+                    )
+                zone_ids.append(zone)
+    return np.array(zone_ids, dtype=np.int32)
+
+
+# ---------------------------------------------------------------------------
 # Shared evaluation reward — identical for ALL controllers
 #
 # Design rationale (each revision addressed):
@@ -184,6 +237,7 @@ def make_3d_profile(profile_name: str) -> Pack3DHeatProfile:
 _REWARD_COMPONENT_KEYS = (
     "reward_too_hot",
     "reward_too_cold",
+    "reward_warn",
     "reward_safe",
     "reward_critical",
     "reward_spread",
@@ -198,6 +252,7 @@ def compute_reward_components(
     u_zones: np.ndarray,
     u_prev: np.ndarray,
     cfg: "PackConfig",
+    u_cmd: Optional[np.ndarray] = None,
 ) -> Tuple[float, Dict[str, float]]:
     """
     Compute the scalar reward and its named components.
@@ -215,10 +270,14 @@ def compute_reward_components(
         actuator smoothness (-0.02× mean Δu²)
 
     Args:
-        T        : (Nx, Ny, Nz) temperature array from the thermal model (°C)
-        u_zones  : current cooling command per zone, clipped to [0, 1]
-        u_prev   : previous step's cooling command
-        cfg      : PackConfig supplying target_low, target_high, safe, critical
+        T       : (Nx, Ny, Nz) temperature array from the thermal model (°C)
+        u_zones : applied cooling command per zone — used for energy penalty
+        u_prev  : previous commanded value — used for smoothness penalty
+        cfg     : PackConfig supplying target_low, target_high, safe, critical
+        u_cmd   : current commanded value (before delay); if provided, the
+                  smoothness term uses (u_cmd - u_prev) so delay doesn't
+                  artificially inflate the smooth penalty.  If None, falls
+                  back to u_zones (backward compatible, no-delay case).
 
     Returns:
         (total_reward, components_dict)
@@ -245,10 +304,20 @@ def compute_reward_components(
     spread = (T_max - T_min) / 5.0
 
     # ── Control cost ──
-    u = np.asarray(u_zones, dtype=np.float64)
+    u = np.asarray(u_zones, dtype=np.float64)   # applied (for energy)
     up = np.asarray(u_prev,  dtype=np.float64)
+    # Smoothness: penalise command chattering; when delay is active,
+    # use the commanded value (not delayed applied) vs previous command.
+    u_s = np.asarray(u_cmd, dtype=np.float64) if u_cmd is not None else u
     energy = float(np.mean(np.square(u)))
-    smooth = float(np.mean(np.square(u - up)))
+    smooth = float(np.mean(np.square(u_s - up)))
+
+    # ── Warning zone: quadratic ramp 3°C before the safety limit ──
+    # Accounts for actuator + sensor delay (≥5s): the policy must start cooling
+    # well before 45°C. Firing at 42°C gives 3°C of early-warning signal.
+    warn_start = safe - 3.0  # 42°C for default config
+    warn_frac  = max(0.0, T_max - warn_start) / max(1e-6, safe - warn_start)
+    r_warn = -5.0 * warn_frac ** 2  # 0 at 42°C → -5.0 at 45°C
 
     # ── Component values ──
     r_hot   = -1.00 * too_hot  ** 2
@@ -260,16 +329,17 @@ def compute_reward_components(
     r_smth  = -0.02 * smooth
     r_hard  = -150.0 if T_max >= crit else 0.0
 
-    total = r_hot + r_cold + r_safe + r_crit + r_sprd + r_ener + r_smth + r_hard
+    total = r_hot + r_cold + r_warn + r_safe + r_crit + r_sprd + r_ener + r_smth + r_hard
 
     components: Dict[str, float] = {
-        "reward_too_hot":     r_hot,
-        "reward_too_cold":    r_cold,
-        "reward_safe":        r_safe,
-        "reward_critical":    r_crit,
-        "reward_spread":      r_sprd,
-        "reward_energy":      r_ener,
-        "reward_smooth":      r_smth,
+        "reward_too_hot":      r_hot,
+        "reward_too_cold":     r_cold,
+        "reward_warn":         r_warn,
+        "reward_safe":         r_safe,
+        "reward_critical":     r_crit,
+        "reward_spread":       r_sprd,
+        "reward_energy":       r_ener,
+        "reward_smooth":       r_smth,
         "reward_hard_penalty": r_hard,
     }
     return float(total), components
@@ -311,18 +381,25 @@ class BatteryPackThermalEnv3D(gym.Env):
         u ∈ [0, 1]^Nx — one cooling command per x-column (zone).
         A scalar or shape-(1,) action is broadcast to all zones for backward compat.
 
-    Observation (without electrochemical profile):
+    Observation — default (enable_sensor_simulation=False):
         dim = 6 + Nx
         [T_max_norm, T_avg_norm, T_min_norm,
          T_gradient_norm, T_variance_norm, T_center_norm,
          u_prev_zone_0, ..., u_prev_zone_{Nx-1}]
 
-    Observation (with ElectrochemicalHeatProfile):
-        dim = 8 + Nx
-        [T_max_norm, T_avg_norm, T_min_norm,
-         T_gradient_norm, T_variance_norm, T_center_norm,
-         SOC_mean, SOC_min,
-         u_prev_zone_0, ..., u_prev_zone_{Nx-1}]
+    Observation — sensor simulation (enable_sensor_simulation=True):
+        dim = n_zones + 8 + n_series_groups + n_zones + n_zones
+        [T_zone_meas_0..3,
+         T_pack_max_est, T_pack_mean_est, T_gradient_est,
+         pack_current_meas, pack_voltage_meas, soc_est,
+         coolant_inlet_meas, coolant_outlet_meas,
+         group_voltage_0..3,
+         u_actual_0..3, u_prev_cmd_0..3]
+        = 24D for a 4-zone, 4S pack.
+        Use this mode for RL training with realistic BMS-style observations.
+
+    Sensor simulation disabled by default to preserve backward compatibility.
+    Enable with: BatteryPackThermalEnv3D(..., enable_sensor_simulation=True)
     """
 
     metadata = {"render_modes": ["human"]}
@@ -336,6 +413,9 @@ class BatteryPackThermalEnv3D(gym.Env):
         dt_s: float = 1.0,
         seed: Optional[int] = 7,
         render_mode: Optional[str] = None,
+        sensor_config: Optional[SensorConfig] = None,
+        actuator_config: Optional[ActuatorConfig] = None,
+        enable_sensor_simulation: bool = False,
     ) -> None:
         super().__init__()
 
@@ -352,14 +432,25 @@ class BatteryPackThermalEnv3D(gym.Env):
             max(1e-6, self.pack_config.safe_temp_c - self.pack_config.target_temp_c)
         )
 
-        # Number of independent cooling zones = number of x-columns
-        self.n_zones: int = self.pack_config.shape[0]
+        # Number of independent cooling zones (2×2 quadrant split by default)
+        self.n_zones: int = self.pack_config.num_cooling_zones
 
         # Detect electrochemical profile by duck-typing on soc_mean property
         self._has_echem: bool = hasattr(self.heat_profile, "soc_mean")
 
-        # Observation dimension: 6 thermal + 2 SOC (if echem) + n_zones action history
-        self._obs_dim: int = 6 + (2 if self._has_echem else 0) + self.n_zones
+        # Sensor simulation mode (opt-in — backward compatible when False)
+        self._use_sensor_sim: bool = enable_sensor_simulation
+
+        # Observation dimension
+        if self._use_sensor_sim:
+            # Base sensor packet: n_zones + 8 pack summary + n_series_groups + n_zones u_actual + n_zones u_prev
+            # + derivative features: dT_zone_dt[n_zones] + dT_gradient_dt[1]
+            n_groups = self.pack_config.series_count
+            self._obs_dim: int = self.n_zones + 8 + n_groups + self.n_zones + self.n_zones + self.n_zones + 1
+            # = 4 + 8 + 4 + 4 + 4 + 4 + 1 = 29  (for n_zones=4, n_groups=4)
+        else:
+            # Legacy: 6 thermal + 2 SOC (if echem) + n_zones action history
+            self._obs_dim = 6 + (2 if self._has_echem else 0) + self.n_zones
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self._obs_dim,), dtype=np.float32
@@ -374,10 +465,72 @@ class BatteryPackThermalEnv3D(gym.Env):
             self.cell_config, self.pack_config, rng=self.rng
         )
 
+        # Zone mapping: flat (k-major) IDs and 3D mask matching T[i,j,k]
+        self.num_cells: int = int(np.prod(self.pack_config.shape))
+        self.zone_ids: np.ndarray = build_zone_ids(self.pack_config.shape, self.n_zones)
+        self.zone_ids_3d: np.ndarray = self._build_zone_ids_3d()
+
+        # Hotspot RNG: separate from main RNG so fixed-seed evals are reproducible
+        if self.pack_config.hotspot_seed is not None:
+            self._hotspot_rng = np.random.default_rng(self.pack_config.hotspot_seed)
+        else:
+            self._hotspot_rng = self.rng  # share main RNG during training
+
+        # Hotspot state (populated in reset via _sample_hotspot_zone)
+        self.hotspot_zone: Optional[int] = None
+        self.hotspot_ids: np.ndarray = np.array([], dtype=np.int32)
+        self.heat_multiplier_3d: np.ndarray = np.ones(self.pack_config.shape, dtype=np.float64)
+
+        # Cooling actuator delay
+        if self.pack_config.enable_cooling_delay:
+            self.delay_steps: int = max(1, int(round(self.pack_config.cooling_delay_s / self.dt_s)))
+        else:
+            self.delay_steps = 0
+        self.action_buffer: list = [
+            np.zeros(self.n_zones, dtype=np.float32) for _ in range(self.delay_steps)
+        ]
+
         self.time_s: float = 0.0
-        self.u_prev_zones: np.ndarray = np.zeros(self.n_zones, dtype=np.float32)
+        self.u_prev_zones: np.ndarray = np.zeros(self.n_zones, dtype=np.float32)  # applied (for obs)
+        self.u_prev_cmd: np.ndarray = np.zeros(self.n_zones, dtype=np.float32)    # commanded (for rate limit)
+        self._last_u_cmd: np.ndarray = np.zeros(self.n_zones, dtype=np.float32)
+        self._last_u_applied: np.ndarray = np.zeros(self.n_zones, dtype=np.float32)
         self.episode_log: Dict[str, list] = {}
         self._last_reward_components: Dict[str, float] = {k: 0.0 for k in _REWARD_COMPONENT_KEYS}
+
+        # Electrical state (estimated from q_gen each step; used by sensor sim)
+        self._soc: float = 1.0
+        self._last_q_cool_total: float = 0.0
+        self._last_sensor_packet: Optional[SensorPacket] = None
+
+        # Previous-step normalized zone temps and gradient for derivative features
+        self._prev_T_zone_norm: np.ndarray = np.zeros(self.n_zones, dtype=np.float32)
+        self._prev_T_gradient_norm: float = 0.0
+
+        # Sensor and actuator simulation (only active when enable_sensor_simulation=True)
+        if self._use_sensor_sim:
+            _sensor_cfg = sensor_config or SensorConfig(num_zones=self.n_zones)
+            # Sync actuator config with PackConfig defaults when not explicitly provided
+            _actuator_cfg = actuator_config or ActuatorConfig(
+                num_zones=self.n_zones,
+                cooling_delay_s=self.pack_config.cooling_delay_s,
+                enable_rate_limit=self.pack_config.enable_cooling_rate_limit,
+                max_cooling_rate_per_s=self.pack_config.max_cooling_rate_per_s,
+            )
+            # zone_ids_3d.flatten() is C-order — matches T.reshape(-1) indexing
+            self.sensor_sim = SensorSimulation(
+                cfg=_sensor_cfg,
+                dt_s=self.dt_s,
+                zone_ids=self.zone_ids_3d.flatten(),
+                seed=seed,
+            )
+            self.actuator_sim = CoolingActuatorSimulation(
+                cfg=_actuator_cfg,
+                dt_s=self.dt_s,
+            )
+        else:
+            self.sensor_sim = None   # type: ignore[assignment]
+            self.actuator_sim = None  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
     # Gymnasium API
@@ -409,7 +562,47 @@ class BatteryPackThermalEnv3D(gym.Env):
 
         self.time_s = 0.0
         self.u_prev_zones = np.zeros(self.n_zones, dtype=np.float32)
+        self.u_prev_cmd = np.zeros(self.n_zones, dtype=np.float32)
+        self._last_u_cmd = np.zeros(self.n_zones, dtype=np.float32)
+        self._last_u_applied = np.zeros(self.n_zones, dtype=np.float32)
+        self.action_buffer = [
+            np.zeros(self.n_zones, dtype=np.float32) for _ in range(self.delay_steps)
+        ]
         self._last_reward_components = {k: 0.0 for k in _REWARD_COMPONENT_KEYS}
+        self._soc = 1.0
+        self._last_q_cool_total = 0.0
+        self._last_sensor_packet = None
+
+        if self._use_sensor_sim:
+            T_flat = self.thermal_model.T.flatten()
+            self.sensor_sim.reset(T_flat)
+            self.actuator_sim.reset()
+            V_nom_cell = self.cell_config.nominal_voltage_v
+            self._last_sensor_packet = self.sensor_sim.measure(
+                T_cells_true_c=T_flat,
+                pack_current_true_a=0.0,
+                pack_voltage_true_v=self.pack_config.series_count * V_nom_cell,
+                group_voltage_true_v=np.full(self.pack_config.series_count, V_nom_cell, dtype=np.float32),
+                soc_true=self._soc,
+                coolant_inlet_true_c=self.pack_config.ambient_temp_c,
+                coolant_outlet_true_c=self.pack_config.ambient_temp_c,
+                u_actual=np.zeros(self.n_zones, dtype=np.float32),
+                u_prev_command=np.zeros(self.n_zones, dtype=np.float32),
+            )
+            # Seed derivative history from initial packet so first-step dT = 0
+            _temp_scale = max(1e-6, self.pack_config.safe_temp_c - self.pack_config.target_temp_c)
+            _temp_ref = self.pack_config.target_temp_c
+            self._prev_T_zone_norm = (
+                (self._last_sensor_packet.T_zone_meas_c - _temp_ref) / _temp_scale
+            ).astype(np.float32)
+            self._prev_T_gradient_norm = float(
+                self._last_sensor_packet.T_gradient_est_c / _temp_scale
+            )
+        else:
+            self._prev_T_zone_norm = np.zeros(self.n_zones, dtype=np.float32)
+            self._prev_T_gradient_norm = 0.0
+
+        self._sample_hotspot_zone()   # sample before first episode
         self._reset_log()
 
         if self._has_echem:
@@ -419,7 +612,26 @@ class BatteryPackThermalEnv3D(gym.Env):
         return obs, self._get_info()
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        u_zones = self._parse_action(action)
+        # Capture previous command BEFORE processing (used for smoothness reward)
+        u_prev_for_reward = self.u_prev_cmd.copy()
+
+        if self._use_sensor_sim:
+            # Actuator simulation handles rate-limit, delay, effectiveness, faults
+            u_cmd_f32, u_applied_f32 = self.actuator_sim.step(action)
+            u_cmd = u_cmd_f32.astype(np.float64)
+            u_applied = u_applied_f32.astype(np.float64)
+            self.u_prev_cmd = self.actuator_sim.u_prev_command.copy()
+        else:
+            u_cmd, u_applied = self._process_cooling_action(action)
+
+        # Optionally resample hotspot at fixed intervals (non-persistent mode)
+        if (
+            not self.pack_config.hotspot_persistent
+            and self.time_s > 0
+            and self.pack_config.hotspot_change_interval_s > 0
+            and int(self.time_s) % int(self.pack_config.hotspot_change_interval_s) == 0
+        ):
+            self._sample_hotspot_zone()
 
         q_gen = _call_heat_profile(
             self.heat_profile,
@@ -428,23 +640,37 @@ class BatteryPackThermalEnv3D(gym.Env):
             self.pack_config.shape,
             self.thermal_model.T,
         )
+        # Global scale factor (stress-test knob) then spatial hotspot overlay
+        if self.pack_config.q_gen_multiplier != 1.0:
+            q_gen = q_gen * self.pack_config.q_gen_multiplier
+        q_gen = q_gen * self.heat_multiplier_3d
 
-        T, metrics = self.thermal_model.step(u_zones=u_zones, dt=self.dt_s, q_gen=q_gen)
+        # Pass per-cell 3D commands so each quadrant zone cools its own cells
+        u_cell_3d = self._zone_action_to_cell_action(u_applied)
+        T, metrics = self.thermal_model.step(u_zones=u_cell_3d, dt=self.dt_s, q_gen=q_gen)
 
         self.time_s += self.dt_s
 
         reward, self._last_reward_components = compute_reward_components(
             T=T,
-            u_zones=u_zones,
-            u_prev=self.u_prev_zones,
+            u_zones=u_applied,          # energy penalty: actual cooling applied
+            u_prev=u_prev_for_reward,   # smoothness reference: prev command
             cfg=self.pack_config,
+            u_cmd=u_cmd,                # smoothness: cmd vs prev cmd (not applied)
         )
 
         terminated = bool(metrics["critical"] or np.min(T) <= -10.0)
         truncated = bool(self.time_s >= self.total_time_s)
 
-        self._log_step(u_zones, reward, metrics, q_gen)
-        self.u_prev_zones = u_zones.astype(np.float32)
+        self._last_u_cmd = u_cmd
+        self._last_u_applied = u_applied
+        self._last_q_cool_total = metrics.get("q_cool_total", 0.0)
+
+        if self._use_sensor_sim:
+            self._last_sensor_packet = self._build_sensor_packet(q_gen)
+
+        self._log_step(u_cmd, u_applied, reward, metrics, q_gen)
+        self.u_prev_zones = u_applied.astype(np.float32)  # obs: what was applied
 
         obs = self._build_obs()
         return obs, reward, terminated, truncated, self._get_info(metrics)
@@ -455,6 +681,10 @@ class BatteryPackThermalEnv3D(gym.Env):
 
     def _build_obs(self) -> np.ndarray:
         """Assemble the full observation vector."""
+        if self._use_sensor_sim and self._last_sensor_packet is not None:
+            return self._normalize_sensor_obs(self._last_sensor_packet)
+
+        # Legacy: normalized thermal features + action history
         thermal_obs = self.thermal_model.get_thermal_obs()  # 6 elements
 
         if self._has_echem:
@@ -466,23 +696,297 @@ class BatteryPackThermalEnv3D(gym.Env):
 
         return np.concatenate([thermal_obs, self.u_prev_zones])
 
+    def _normalize_sensor_obs(self, packet: SensorPacket) -> np.ndarray:
+        """
+        Normalize a SensorPacket into a policy-friendly observation vector.
+
+        All features are scaled to approximately [-1, 2]:
+          Temperatures → (T - target_temp) / (safe_temp - target_temp)
+                          0 at target, 1 at safe limit, <0 if too cold
+          Gradient      → gradient / (safe_temp - target_temp)
+          Current       → I_pack / I_pack_max  (0–1 under normal operation)
+          Voltage       → (V - V_nominal) / V_range  (≈ -0.5 to +0.5)
+          SOC           → unchanged [0, 1]
+          Coolant temps → (T - ambient) / (safe - ambient)
+          Group voltage → (V_cell - V_nom_cell) / V_cell_range
+          Cooling cmds  → unchanged [0, 1]
+        """
+        cfg = self.pack_config
+        cell = self.cell_config
+
+        temp_scale = max(1e-6, cfg.safe_temp_c - cfg.target_temp_c)  # 10°C
+        temp_ref = cfg.target_temp_c                                    # 35°C
+
+        T_zone_norm = (packet.T_zone_meas_c - temp_ref) / temp_scale
+
+        pack_max_norm  = (packet.T_pack_max_est_c  - temp_ref) / temp_scale
+        pack_mean_norm = (packet.T_pack_mean_est_c - temp_ref) / temp_scale
+        pack_grad_norm = packet.T_gradient_est_c / temp_scale
+
+        I_max_pack = cell.max_continuous_discharge_a * cfg.parallel_count
+        V_nom_pack = cfg.series_count * cell.nominal_voltage_v
+        V_range_pack = cfg.series_count * (cell.max_voltage_v - cell.cutoff_voltage_v) / 2.0
+        I_norm = packet.pack_current_meas_a / max(1.0, I_max_pack)
+        V_norm = (packet.pack_voltage_meas_v - V_nom_pack) / max(1.0, V_range_pack)
+        SOC   = float(np.clip(packet.soc_est, 0.0, 1.0))
+
+        coolant_scale = max(1.0, cfg.safe_temp_c - cfg.ambient_temp_c)
+        T_in_norm  = (packet.coolant_inlet_temp_meas_c  - cfg.ambient_temp_c) / coolant_scale
+        T_out_norm = (packet.coolant_outlet_temp_meas_c - cfg.ambient_temp_c) / coolant_scale
+
+        V_nom_cell   = cell.nominal_voltage_v
+        V_range_cell = (cell.max_voltage_v - cell.cutoff_voltage_v) / 2.0
+        V_group_norm = (packet.group_voltage_meas_v - V_nom_cell) / max(1e-6, V_range_cell)
+
+        # Derivative features: change in normalized values since previous step.
+        # At step 0 (reset), prev values equal current so derivatives are zero.
+        dT_zone_norm     = T_zone_norm.astype(np.float32) - self._prev_T_zone_norm
+        dT_gradient_norm = float(pack_grad_norm) - self._prev_T_gradient_norm
+
+        # Update history for next call
+        self._prev_T_zone_norm    = T_zone_norm.astype(np.float32)
+        self._prev_T_gradient_norm = float(pack_grad_norm)
+
+        return np.concatenate([
+            T_zone_norm.astype(np.float32),
+            np.array([pack_max_norm, pack_mean_norm, pack_grad_norm,
+                      I_norm, V_norm, SOC, T_in_norm, T_out_norm], dtype=np.float32),
+            V_group_norm.astype(np.float32),
+            np.clip(packet.u_actual_feedback, 0.0, 1.0).astype(np.float32),
+            np.clip(packet.u_prev_command, 0.0, 1.0).astype(np.float32),
+            dT_zone_norm,
+            np.array([dT_gradient_norm], dtype=np.float32),
+        ]).astype(np.float32)
+
     # ------------------------------------------------------------------
-    # Action parsing (backward compatible)
+    # Curriculum support
     # ------------------------------------------------------------------
 
-    def _parse_action(self, action: np.ndarray) -> np.ndarray:
+    def update_sensor_config(
+        self,
+        sensor_config: "SensorConfig",
+        actuator_config: Optional["ActuatorConfig"] = None,
+        seed: Optional[int] = None,
+    ) -> None:
         """
-        Accept scalar, shape-(1,), or shape-(n_zones,) action.
-        Scalar/single-value is broadcast to all zones.
+        Replace the active sensor/actuator simulation objects in-place.
+
+        Called by CurriculumCallback at training stage boundaries to
+        progressively increase environment difficulty without recreating
+        the entire env (which would reset VecNormalize statistics).
+        Only has effect when enable_sensor_simulation=True.
         """
-        arr = np.asarray(action, dtype=np.float64).reshape(-1)
-        if arr.size == 1:
-            arr = np.full(self.n_zones, float(arr[0]))
-        elif arr.size != self.n_zones:
-            raise ValueError(
-                f"Expected action of size 1 or {self.n_zones}, got {arr.size}"
+        if not self._use_sensor_sim:
+            return
+        _seed = seed if seed is not None else int(self.rng.integers(0, 2**31))
+        T_flat = self.thermal_model.T.flatten()
+        self.sensor_sim = SensorSimulation(
+            cfg=sensor_config,
+            dt_s=self.dt_s,
+            zone_ids=self.zone_ids_3d.flatten(),
+            seed=_seed,
+        )
+        self.sensor_sim.reset(T_flat)
+        if actuator_config is not None:
+            self.actuator_sim = CoolingActuatorSimulation(
+                cfg=actuator_config, dt_s=self.dt_s
             )
-        return np.clip(arr, 0.0, 1.0).astype(np.float64)
+            self.actuator_sim.reset()
+
+    # ------------------------------------------------------------------
+    # Hotspot sampling
+    # ------------------------------------------------------------------
+
+    def _sample_hotspot_zone(self) -> None:
+        """
+        Randomly select a cooling zone and hotspot cells within it.
+
+        Zone is drawn uniformly from [0, n_zones). Cells are drawn without
+        replacement from the selected zone's cell pool. A per-cell multiplier
+        in [hotspot_multiplier_min, hotspot_multiplier_max] is applied to q_gen
+        so one region heats faster than the rest.
+
+        When enable_random_hotspot=False, heat_multiplier_3d stays all-ones
+        (no spatial bias — used for ablation/baseline comparison).
+
+        Hotspot location is logged in info as hotspot_zone and hotspot_ids.
+        """
+        if not self.pack_config.enable_random_hotspot:
+            self.hotspot_zone = None
+            self.hotspot_ids = np.array([], dtype=np.int32)
+            self.heat_multiplier_3d = np.ones(self.pack_config.shape, dtype=np.float64)
+            return
+
+        rng = self._hotspot_rng
+        Nx, Ny, Nz = self.pack_config.shape
+
+        # Pick a random zone to stress
+        hotspot_zone = int(rng.integers(0, self.n_zones))
+        cells_in_zone = np.where(self.zone_ids == hotspot_zone)[0]
+
+        n_hot = min(self.pack_config.num_hotspot_cells, len(cells_in_zone))
+        hotspot_ids = rng.choice(cells_in_zone, size=n_hot, replace=False).astype(np.int32)
+
+        # Build 3D multiplier array; default = 1.0, elevated at hotspot cells
+        mult_3d = np.ones((Nx, Ny, Nz), dtype=np.float64)
+        for flat_idx in hotspot_ids:
+            # Convert flat k-major index → (i, j, k) for T indexing
+            k = int(flat_idx) // (Nx * Ny)
+            j = (int(flat_idx) % (Nx * Ny)) // Nx
+            i = int(flat_idx) % Nx
+            mult_3d[i, j, k] = rng.uniform(
+                self.pack_config.hotspot_multiplier_min,
+                self.pack_config.hotspot_multiplier_max,
+            )
+
+        self.hotspot_zone = hotspot_zone
+        self.hotspot_ids = hotspot_ids
+        self.heat_multiplier_3d = mult_3d
+
+    # ------------------------------------------------------------------
+    # Action processing: broadcast → rate-limit → delay
+    # ------------------------------------------------------------------
+
+    def _process_cooling_action(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Process a controller action through the full actuator chain.
+
+        Steps:
+            1. Broadcast scalar / shape-(1,) to all zones.
+            2. Clip to [0, 1].
+            3. Rate-limit: constrain per-step change to max_cooling_rate_per_s * dt.
+            4. Delay: push into buffer; pop the oldest entry as u_applied.
+
+        Returns:
+            u_cmd    : rate-limited command (what the controller requested this step)
+            u_applied: delayed command (what the physics actually receives this step)
+
+        Baseline controllers returning scalar or shape-(1,) are broadcast here,
+        so they experience the same delay and rate-limit as RL agents — fair comparison.
+        """
+        u_cmd = np.asarray(action, dtype=np.float64).reshape(-1)
+        if u_cmd.size == 1:
+            u_cmd = np.full(self.n_zones, float(u_cmd[0]))
+        elif u_cmd.size != self.n_zones:
+            raise ValueError(
+                f"Expected action of size 1 or {self.n_zones}, got {u_cmd.size}"
+            )
+        u_cmd = np.clip(u_cmd, 0.0, 1.0)
+
+        if self.pack_config.enable_cooling_rate_limit:
+            max_delta = self.pack_config.max_cooling_rate_per_s * self.dt_s
+            u_cmd = np.clip(
+                u_cmd,
+                self.u_prev_cmd - max_delta,
+                self.u_prev_cmd + max_delta,
+            )
+            u_cmd = np.clip(u_cmd, 0.0, 1.0)
+
+        if self.delay_steps > 0:
+            self.action_buffer.append(u_cmd.copy())
+            u_applied = self.action_buffer.pop(0)
+        else:
+            u_applied = u_cmd.copy()
+
+        self.u_prev_cmd = u_cmd.astype(np.float32)
+        return u_cmd.astype(np.float64), u_applied.astype(np.float64)
+
+    def _zone_action_to_cell_action(self, u_applied_zones: np.ndarray) -> np.ndarray:
+        """
+        Convert per-zone commands, shape (n_zones,), to a per-cell 3D array
+        matching T.shape = (Nx, Ny, Nz) using the precomputed zone_ids_3d mask.
+        """
+        return u_applied_zones[self.zone_ids_3d].astype(np.float64)
+
+    def _build_zone_ids_3d(self) -> np.ndarray:
+        """
+        Reshape flat zone_ids (k-major order) to 3D array (i, j, k) so that
+        zone_ids_3d[i, j, k] == zone of cell T[i, j, k].
+        """
+        Nx, Ny, Nz = self.pack_config.shape
+        z3d = np.zeros((Nx, Ny, Nz), dtype=np.int32)
+        c = 0
+        for k in range(Nz):
+            for j in range(Ny):
+                for i in range(Nx):
+                    z3d[i, j, k] = self.zone_ids[c]
+                    c += 1
+        return z3d
+
+    def _get_zone_max_temps(self) -> np.ndarray:
+        """Return max temperature per cooling zone, shape (n_zones,)."""
+        result = np.zeros(self.n_zones, dtype=np.float64)
+        for z in range(self.n_zones):
+            mask = self.zone_ids_3d == z
+            result[z] = float(self.thermal_model.T[mask].max()) if mask.any() else self.pack_config.ambient_temp_c
+        return result
+
+    def _estimate_electrical_state(self, q_gen: np.ndarray) -> Dict:
+        """
+        Estimate pack-level electrical state from the current q_gen array.
+
+        Used by _build_sensor_packet() to supply approximate current/voltage/SOC
+        when no electrochemical model is attached. The estimates are physically
+        consistent (I²R heat balance) but not high-fidelity.
+        """
+        q_total = float(np.sum(q_gen))
+        R_dc = self.cell_config.dc_ir_ohm
+        # Back-calculate per-cell current from I²R: I_cell = sqrt(q_cell / R_dc)
+        I_cell = float(np.sqrt(max(0.0, q_total / max(1, self.num_cells) / max(1e-9, R_dc))))
+        I_pack = I_cell * self.pack_config.parallel_count
+
+        V_nom_cell = self.cell_config.nominal_voltage_v
+        V_pack = self.pack_config.series_count * V_nom_cell
+        V_group = np.full(self.pack_config.series_count, V_nom_cell, dtype=np.float32)
+
+        # Coulomb counting (rough; resets to 1.0 on each episode reset)
+        cap_as = self.cell_config.capacity_ah * 3600.0
+        self._soc = float(np.clip(self._soc - I_cell * self.dt_s / max(1.0, cap_as), 0.0, 1.0))
+
+        return {
+            "pack_current_a": I_pack,
+            "pack_voltage_v": V_pack,
+            "group_voltage_v": V_group,
+            "soc": self._soc,
+        }
+
+    def _build_sensor_packet(self, q_gen: np.ndarray) -> SensorPacket:
+        """
+        Generate a BMS-style sensor measurement from the current thermal/electrical state.
+        Called once per step when enable_sensor_simulation=True.
+        """
+        if self._has_echem:
+            # Prefer electrochemical model's electrical state when available
+            elec = {
+                "pack_current_a": getattr(self.heat_profile, "pack_current_a", 0.0),
+                "pack_voltage_v": self.pack_config.series_count * self.cell_config.nominal_voltage_v,
+                "group_voltage_v": np.full(
+                    self.pack_config.series_count,
+                    self.cell_config.nominal_voltage_v,
+                    dtype=np.float32,
+                ),
+                "soc": getattr(self.heat_profile, "soc_mean", self._soc),
+            }
+        else:
+            elec = self._estimate_electrical_state(q_gen)
+
+        T_flat = self.thermal_model.T.flatten()  # C-order — matches zone_ids_3d.flatten()
+
+        coolant_inlet_c = self.pack_config.ambient_temp_c
+        # Rough coolant outlet: inlet + heat removed / nominal exchange capacity
+        coolant_outlet_c = coolant_inlet_c + self._last_q_cool_total / 5000.0
+
+        return self.sensor_sim.measure(
+            T_cells_true_c=T_flat,
+            pack_current_true_a=elec["pack_current_a"],
+            pack_voltage_true_v=elec["pack_voltage_v"],
+            group_voltage_true_v=elec["group_voltage_v"],
+            soc_true=elec["soc"],
+            coolant_inlet_true_c=coolant_inlet_c,
+            coolant_outlet_true_c=coolant_outlet_c,
+            u_actual=self._last_u_applied,
+            u_prev_command=self.u_prev_cmd,
+        )
 
     # ------------------------------------------------------------------
     # Reward — delegated to module-level compute_reward_components()
@@ -497,6 +1001,20 @@ class BatteryPackThermalEnv3D(gym.Env):
         if metrics is None:
             metrics = self.thermal_model.get_metrics()
         n_above_safe = int(np.sum(self.thermal_model.T > self.pack_config.safe_temp_c))
+
+        # True zone max temps (always computed for logging)
+        zone_max_true = self._get_zone_max_temps()
+
+        # zone_max_temps in info: measured (noisy) when sensor sim active, true otherwise.
+        # Zone controllers use info["zone_max_temps"] — this makes them use measured values.
+        if self._use_sensor_sim and self._last_sensor_packet is not None:
+            pkt = self._last_sensor_packet
+            zone_max_for_info = pkt.T_zone_meas_c
+        else:
+            zone_max_for_info = zone_max_true
+
+        delay_steps = self.actuator_sim.delay_steps if self._use_sensor_sim else self.delay_steps
+
         info = {
             "time_s": self.time_s,
             "T_max": metrics["T_max"],
@@ -507,10 +1025,41 @@ class BatteryPackThermalEnv3D(gym.Env):
             "critical": metrics["critical"],
             "n_cells_above_safe": n_above_safe,
             "u_prev_zones": self.u_prev_zones.tolist(),
+            "u_cmd_zones": self._last_u_cmd.tolist(),
+            "u_applied_zones": self._last_u_applied.tolist(),
+            "cooling_delay_steps": delay_steps,
             "temperatures_3d": self.thermal_model.T.copy(),
-            "zone_max_temps": self.thermal_model.get_zone_max_temps().tolist(),
+            "zone_max_temps": zone_max_for_info.tolist(),
+            "zone_max_temps_true": zone_max_true.tolist(),
         }
-        # Reward components — same keys for every controller (R1, R6)
+
+        # Measured/estimated values for classical baseline controllers and diagnostics
+        if self._use_sensor_sim and self._last_sensor_packet is not None:
+            pkt = self._last_sensor_packet
+            info["T_max_meas"] = pkt.T_pack_max_est_c
+            info["T_mean_meas"] = pkt.T_pack_mean_est_c
+            info["T_grad_meas"] = pkt.T_gradient_est_c
+            info["soc_est"] = pkt.soc_est
+            info["coolant_inlet_meas"] = pkt.coolant_inlet_temp_meas_c
+            info["coolant_outlet_meas"] = pkt.coolant_outlet_temp_meas_c
+            # Sensor health — exposed so dropout/fault is never silently hidden
+            info["sensor_fault_flags"] = pkt.sensor_fault_flags
+            info["sensor_dropout_active"] = bool(pkt.sensor_fault_flags.get("temperature_dropout", False))
+            # Actuator fault diagnostic
+            if self.actuator_sim is not None:
+                info["actuator_fault_active"] = bool(self.actuator_sim.cfg.enable_actuator_fault)
+                info["u_cmd_zones"] = self._last_u_cmd.tolist()   # override with actuator sim values
+                info["u_actual_zones"] = self.actuator_sim.u_actual.tolist()
+            else:
+                info["actuator_fault_active"] = False
+
+        # Per-zone applied cooling
+        for z in range(self.n_zones):
+            info[f"u_zone_{z}"] = float(self._last_u_applied[z])
+        # Hotspot metadata
+        info["hotspot_zone"] = self.hotspot_zone
+        info["hotspot_ids"] = self.hotspot_ids.tolist()
+        # Reward components
         info.update(self._last_reward_components)
         if self._has_echem:
             info["soc_mean"] = self.heat_profile.soc_mean
@@ -525,13 +1074,27 @@ class BatteryPackThermalEnv3D(gym.Env):
             "T_min": [],
             "T_gradient": [],
             "n_cells_above_safe": [],
-            "actions": [],          # shape (n_zones,) per step
+            "actions": [],          # alias for u_applied (backward compat)
+            "u_cmd": [],            # commanded (before delay), shape (n_zones,) per step
+            "u_applied": [],        # actually applied (after delay), shape (n_zones,) per step
             "reward": [],
             "q_gen_total": [],
             "q_gen_max_cell": [],
             "q_cool_total": [],
-            "q_cool_per_zone": [],  # shape (n_zones,) per step
-            "zone_max_temps": [],   # shape (n_zones,) per step
+            "q_cool_per_zone": [],
+            "zone_max_temps": [],        # per-zone measured (or true if no sensor sim)
+            "zone_max_temps_true": [],   # per-zone true (always)
+            **{f"u_zone_{z}": [] for z in range(self.n_zones)},
+            "hotspot_zone": [],
+            "hotspot_cell_ids": [],      # flat cell IDs of active hotspot
+            "q_hotspot_boost": [],
+            # Sensor diagnostics (populated when sensor sim is active, else 0/False)
+            "sensor_dropout_active": [],
+            "actuator_fault_active": [],
+            # Multi-zone targeting: is the highest-cooled zone the hottest measured zone?
+            "targeting_correct": [],   # bool per step
+            "hot_zone_meas": [],       # argmax of measured zone temps
+            "max_cool_zone": [],       # argmax of u_applied
             # Reward components — logged every step for diagnosis (R6)
             **{k: [] for k in _REWARD_COMPONENT_KEYS},
         }
@@ -539,7 +1102,30 @@ class BatteryPackThermalEnv3D(gym.Env):
             self.episode_log["soc_mean"] = []
             self.episode_log["soc_min"] = []
 
-    def _log_step(self, u_zones: np.ndarray, reward: float, metrics: Dict, q_gen: np.ndarray) -> None:
+    def _log_step(
+        self,
+        u_cmd: np.ndarray,
+        u_applied: np.ndarray,
+        reward: float,
+        metrics: Dict,
+        q_gen: np.ndarray,
+    ) -> None:
+        zone_max_true = self._get_zone_max_temps()
+
+        # Measured zone temps (same as true when sensor sim is off)
+        if self._use_sensor_sim and self._last_sensor_packet is not None:
+            zone_max_meas = self._last_sensor_packet.T_zone_meas_c
+            sensor_dropout = bool(self._last_sensor_packet.sensor_fault_flags.get("temperature_dropout", False))
+        else:
+            zone_max_meas = zone_max_true
+            sensor_dropout = False
+
+        actuator_fault = bool(
+            self._use_sensor_sim
+            and self.actuator_sim is not None
+            and self.actuator_sim.cfg.enable_actuator_fault
+        )
+
         self.episode_log["time"].append(self.time_s)
         self.episode_log["T_max"].append(metrics["T_max"])
         self.episode_log["T_avg"].append(metrics["T_avg"])
@@ -548,13 +1134,32 @@ class BatteryPackThermalEnv3D(gym.Env):
         self.episode_log["n_cells_above_safe"].append(
             int(np.sum(self.thermal_model.T > self.pack_config.safe_temp_c))
         )
-        self.episode_log["actions"].append(u_zones.tolist())
+        self.episode_log["actions"].append(u_applied.tolist())
+        self.episode_log["u_cmd"].append(u_cmd.tolist())
+        self.episode_log["u_applied"].append(u_applied.tolist())
         self.episode_log["reward"].append(reward)
         self.episode_log["q_gen_total"].append(float(np.sum(q_gen)))
         self.episode_log["q_gen_max_cell"].append(float(np.max(q_gen)))
         self.episode_log["q_cool_total"].append(metrics.get("q_cool_total", 0.0))
         self.episode_log["q_cool_per_zone"].append(metrics.get("q_cool_per_zone", []))
-        self.episode_log["zone_max_temps"].append(self.thermal_model.get_zone_max_temps().tolist())
+        self.episode_log["zone_max_temps"].append(zone_max_meas.tolist())
+        self.episode_log["zone_max_temps_true"].append(zone_max_true.tolist())
+        for z in range(self.n_zones):
+            self.episode_log[f"u_zone_{z}"].append(float(u_applied[z]))
+        self.episode_log["hotspot_zone"].append(self.hotspot_zone)
+        self.episode_log["hotspot_cell_ids"].append(self.hotspot_ids.tolist())
+        boost = float(np.sum(q_gen * (self.heat_multiplier_3d - 1.0)))
+        self.episode_log["q_hotspot_boost"].append(boost)
+        self.episode_log["sensor_dropout_active"].append(sensor_dropout)
+        self.episode_log["actuator_fault_active"].append(actuator_fault)
+
+        # Zone targeting: is the highest-cooled zone the hottest measured zone?
+        hot_zone = int(np.argmax(zone_max_meas))
+        max_cool_zone = int(np.argmax(u_applied)) if np.any(u_applied > 0) else -1
+        self.episode_log["hot_zone_meas"].append(hot_zone)
+        self.episode_log["max_cool_zone"].append(max_cool_zone)
+        self.episode_log["targeting_correct"].append(int(hot_zone == max_cool_zone))
+
         for k in _REWARD_COMPONENT_KEYS:
             self.episode_log[k].append(self._last_reward_components.get(k, 0.0))
         if self._has_echem:
@@ -608,7 +1213,8 @@ if __name__ == "__main__":
     terminated = truncated = False
 
     while not (terminated or truncated):
-        # Zone-proportional controller: each zone gets proportional cooling to its max temp
+        # Zone-proportional controller: each quadrant gets cooling proportional
+        # to its local max temperature (exploits multi-zone control)
         zone_max = np.array(info["zone_max_temps"])
         kp = 0.1
         action = np.clip(kp * (zone_max - env.pack_config.target_temp_c), 0.0, 1.0).astype(np.float32)
@@ -616,9 +1222,11 @@ if __name__ == "__main__":
         total_reward += reward
 
     log = env.get_episode_log()
-    print(f"\nSmoke test — 3D pack env (multi-zone)")
-    print(f"Final T_max:      {log['T_max'][-1]:.2f} °C")
-    print(f"Final T_avg:      {log['T_avg'][-1]:.2f} °C")
-    print(f"Final T_gradient: {log['T_gradient'][-1]:.3f} °C")
-    print(f"Total reward:     {total_reward:.2f}")
-    print(f"Final zone actions: {log['actions'][-1]}")
+    print(f"\nSmoke test — 3D pack env (quadrant multi-zone + delay)")
+    print(f"Final T_max:        {log['T_max'][-1]:.2f} °C")
+    print(f"Final T_avg:        {log['T_avg'][-1]:.2f} °C")
+    print(f"Final T_gradient:   {log['T_gradient'][-1]:.3f} °C")
+    print(f"Total reward:       {total_reward:.2f}")
+    print(f"Delay steps:        {env.delay_steps}")
+    print(f"Final u_cmd:        {log['u_cmd'][-1]}")
+    print(f"Final u_applied:    {log['u_applied'][-1]}")

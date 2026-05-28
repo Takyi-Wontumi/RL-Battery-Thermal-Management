@@ -52,9 +52,11 @@ from envs.battery_pack_thermal_env_3d import (
 )
 from scripts.compare_pack_baselines_3d import (
     PROFILE_NAMES,
+    ZonePI3D,
     build_3d_baseline_controllers,
     run_controller_case,
 )
+from training.train_pack_ppo_3d import make_sensor_config, make_actuator_config
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +79,8 @@ def parse_args() -> argparse.Namespace:
                    help="Total evaluation episodes across all profiles (default: 20)")
     p.add_argument("--seed",         type=int, default=7,
                    help="Base random seed (default: 7)")
+    p.add_argument("--shield",       action="store_true",
+                   help="Wrap RL controllers with safety shield (Zone PI override at 44°C)")
     return p.parse_args()
 
 
@@ -87,6 +91,8 @@ def parse_args() -> argparse.Namespace:
 class PackSAC3DController:
     """SAC adapter — uses raw observations, no VecNormalize."""
 
+    controller_type = "Multi-zone RL"
+
     def __init__(self, model: SAC, name: str = "SAC") -> None:
         self.model = model
         self.name  = name
@@ -94,30 +100,86 @@ class PackSAC3DController:
     def reset(self) -> None:
         pass
 
-    def act(self, obs: np.ndarray) -> np.ndarray:
+    def act(self, obs: np.ndarray, info=None) -> np.ndarray:
         obs_in = np.asarray(obs, dtype=np.float32).reshape(1, -1)
         action, _ = self.model.predict(obs_in, deterministic=True)
-        u = float(np.clip(np.asarray(action).reshape(-1)[0], 0.0, 1.0))
-        return np.array([u], dtype=np.float32)
+        return np.clip(np.asarray(action).reshape(-1), 0.0, 1.0).astype(np.float32)
 
 
 class PackPPO3DController:
     """PPO adapter — normalises observations with stored VecNormalize stats."""
 
+    controller_type = "Multi-zone RL"
+
     def __init__(self, model: PPO, vec_normalize: VecNormalize, name: str = "PPO") -> None:
-        self.model        = model
+        self.model         = model
         self.vec_normalize = vec_normalize
-        self.name         = name
+        self.name          = name
 
     def reset(self) -> None:
         pass
 
-    def act(self, obs: np.ndarray) -> np.ndarray:
+    def act(self, obs: np.ndarray, info=None) -> np.ndarray:
         obs_batch = np.asarray(obs, dtype=np.float32).reshape(1, -1)
         norm_obs  = self.vec_normalize.normalize_obs(obs_batch)
         action, _ = self.model.predict(norm_obs, deterministic=True)
-        u = float(np.clip(np.asarray(action).reshape(-1)[0], 0.0, 1.0))
-        return np.array([u], dtype=np.float32)
+        return np.clip(np.asarray(action).reshape(-1), 0.0, 1.0).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Safety shield
+# ---------------------------------------------------------------------------
+
+class SafetyShieldedRL:
+    """
+    Wraps an RL controller with a Zone PI override when temperature approaches the safe limit.
+
+    In nominal conditions (T_max < shield_temp_c) the RL policy acts freely.
+    When T_max_meas >= shield_temp_c, per-zone action is max(u_rl, u_zone_pi).
+    When T_max_meas >= full_cooling_temp_c, full cooling (u=1) overrides RL entirely.
+
+    This prevents undercooling emergencies without interfering with RL in normal operation.
+    """
+
+    controller_type = "Multi-zone RL"
+
+    def __init__(
+        self,
+        rl_controller,
+        pack_config: PackConfig,
+        shield_temp_c: float = 44.0,
+        full_cooling_temp_c: float = 44.5,
+    ) -> None:
+        self.rl            = rl_controller
+        self.name          = f"{rl_controller.name} + Shield"
+        self.shield_temp_c = shield_temp_c
+        self.full_temp_c   = full_cooling_temp_c
+        self._zone_pi = ZonePI3D(
+            pack_config=pack_config,
+            num_zones=pack_config.num_cooling_zones,
+        )
+
+    def reset(self) -> None:
+        self.rl.reset()
+        self._zone_pi.reset()
+
+    def act(self, obs: np.ndarray, info=None) -> np.ndarray:
+        u_rl = self.rl.act(obs, info)
+
+        if info is not None:
+            T_max = float(info.get("T_max_meas", info.get("T_max", 0.0)))
+        else:
+            # Fallback: obs[4] = pack_max_norm in 29D layout → T ≈ obs[4]*10 + 35
+            T_max = float(obs[4]) * 10.0 + 35.0
+
+        if T_max >= self.full_temp_c:
+            return np.ones(len(u_rl), dtype=np.float32)
+
+        if T_max >= self.shield_temp_c:
+            u_pi = self._zone_pi.act(obs, info)
+            return np.maximum(u_rl, u_pi).astype(np.float32)
+
+        return u_rl
 
 
 # ---------------------------------------------------------------------------
@@ -125,20 +187,27 @@ class PackPPO3DController:
 # ---------------------------------------------------------------------------
 
 def _make_dummy_env(pack_config: PackConfig) -> DummyVecEnv:
+    """Dummy env used to load PPO's VecNormalize — must match training obs dim (29D)."""
     def _init():
         env = BatteryPackThermalEnv3D(
             cell_config=CellConfig(),
             pack_config=pack_config,
             heat_profile=uniform_constant_3d_heat(),
             seed=0,
+            enable_sensor_simulation=True,
+            sensor_config=make_sensor_config(pack_config),
+            actuator_config=make_actuator_config(pack_config),
         )
         return Monitor(env)
     return DummyVecEnv([_init])
 
 
 def _expected_obs_dim(pack_config: PackConfig) -> int:
-    """Obs dim produced by the current env for a given pack config (no echem profile)."""
-    return 6 + pack_config.shape[0]  # 6 thermal stats + n_zones action history
+    """Obs dim for sensor-sim training: zone_temps + pack_summary + group_voltages
+    + u_actual + u_prev + dT_zone + dT_grad."""
+    n_zones  = pack_config.num_cooling_zones
+    n_groups = pack_config.series_count
+    return n_zones + 8 + n_groups + n_zones + n_zones + n_zones + 1  # 29 for 4-zone 4S
 
 
 def load_sac(model_path: str, pack_config: PackConfig, name: str = "SAC") -> Optional[PackSAC3DController]:
@@ -214,11 +283,15 @@ def build_controllers(
     if args.sac_model:
         ctrl = load_sac(args.sac_model, pack_config, name="SAC")
         if ctrl:
+            if getattr(args, "shield", False):
+                ctrl = SafetyShieldedRL(ctrl, pack_config)
             controllers.append(ctrl)
 
     if args.ppo_model:
         ctrl = load_ppo(args.ppo_model, args.ppo_vecnorm, pack_config, name="PPO")
         if ctrl:
+            if getattr(args, "shield", False):
+                ctrl = SafetyShieldedRL(ctrl, pack_config)
             controllers.append(ctrl)
 
     return controllers
@@ -238,6 +311,9 @@ def run_all(
     all_logs: Dict[Tuple, Dict] = {}
     rows: List[Dict] = []
 
+    sensor_cfg   = make_sensor_config(pack_config)
+    actuator_cfg = make_actuator_config(pack_config)
+
     for round_idx in range(n_rounds):
         seed = seed_base + round_idx * 100
         for profile in PROFILE_NAMES:
@@ -248,6 +324,9 @@ def run_all(
                     cell_config=cell_config,
                     pack_config=pack_config,
                     seed=seed,
+                    enable_sensor_simulation=True,
+                    sensor_config=sensor_cfg,
+                    actuator_config=actuator_cfg,
                 )
                 all_logs[(round_idx, profile, ctrl.name)] = log
                 metrics.update({"round": round_idx, "seed": seed})

@@ -32,8 +32,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Defaults
 # ---------------------------------------------------------------------------
-PPO_STEPS=1000000
-SAC_STEPS=750000
+PPO_STEPS=5000000
+SAC_STEPS=3000000
 N_ENVS=4
 DEVICE="auto"
 BASELINES_ONLY=false
@@ -154,29 +154,31 @@ fi
 # ---------------------------------------------------------------------------
 # Stage 3 — PPO training
 # ---------------------------------------------------------------------------
-run_stage "PPO training ($PPO_STEPS steps)" \
+run_stage "PPO training ($PPO_STEPS steps, curriculum)" \
     $PYTHON training/train_pack_ppo_3d.py \
         --timesteps "$PPO_STEPS" \
         --n-envs "$N_ENVS" \
         --device "$DEVICE" \
-        --save-dir models/ppo_pack_3d \
-        --log-dir  logs/ppo_pack_3d
+        --curriculum \
+        --save-dir models/ppo_pack_3d_multizone_sensor \
+        --log-dir  logs/ppo_pack_3d_multizone_sensor
 
 # ---------------------------------------------------------------------------
 # Stage 4 — SAC training
 # ---------------------------------------------------------------------------
-run_stage "SAC training ($SAC_STEPS steps)" \
+run_stage "SAC training ($SAC_STEPS steps, curriculum)" \
     $PYTHON training/train_pack_sac_3d.py \
         --timesteps "$SAC_STEPS" \
         --device "$DEVICE" \
-        --save-dir models/sac_pack_3d \
-        --log-dir  logs/sac_pack_3d
+        --curriculum \
+        --save-dir models/sac_pack_3d_multizone_sensor \
+        --log-dir  logs/sac_pack_3d_multizone_sensor
 
 # ---------------------------------------------------------------------------
 # Stage 5 — Full evaluation (baselines + whichever RL models exist)
 # ---------------------------------------------------------------------------
-PPO_MODEL="models/ppo_pack_3d/best_model.zip"
-SAC_MODEL="models/sac_pack_3d/best_model.zip"
+PPO_MODEL="models/ppo_pack_3d_multizone_sensor/best_model.zip"
+SAC_MODEL="models/sac_pack_3d_multizone_sensor/best_model.zip"
 
 EVAL_ARGS=(
     --results-dir outputs/comparison
@@ -241,10 +243,10 @@ echo "    outputs/                          — baseline benchmark plots/CSV"
 echo "    outputs/comparison/               — full evaluation plots/CSV"
 echo "    outputs/3d_viz/                   — 3D PyVista screenshots + comparison figure"
 echo "    outputs/3d_pyvista_*_*.gif        — GIF animations (all controllers)"
-echo "    models/ppo_pack_3d/              — PPO weights"
-echo "    models/sac_pack_3d/              — SAC weights"
-echo "    logs/ppo_pack_3d/                — PPO TensorBoard logs"
-echo "    logs/sac_pack_3d/                — SAC TensorBoard logs"
+echo "    models/ppo_pack_3d_multizone_sensor/  — PPO weights"
+echo "    models/sac_pack_3d_multizone_sensor/  — SAC weights"
+echo "    logs/ppo_pack_3d_multizone_sensor/    — PPO TensorBoard logs"
+echo "    logs/sac_pack_3d_multizone_sensor/    — SAC TensorBoard logs"
 echo ""
 echo "  TensorBoard:"
 echo "    $PYTHON -m tensorboard.main --logdir logs/"
